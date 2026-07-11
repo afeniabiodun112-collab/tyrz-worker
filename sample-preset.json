@@ -1,0 +1,11 @@
+{
+  "trim": { "cutStart": 3, "cutEnd": 2 },
+  "cover": {
+    "enabled": true,
+    "x": 70, "y": 85, "w": 25, "h": 10,
+    "color": "#ffffff",
+    "text": "TYRZ",
+    "textColor": "#000000"
+  },
+  "pip": { "enabled": false }
+}

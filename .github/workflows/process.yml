@@ -1,0 +1,48 @@
+name: TYRZ Process Video
+
+# Fired by the TYRZ server via the REST API:
+#   POST /repos/<owner>/tyrz-worker/dispatches
+#   { "event_type": "process-video", "client_payload": { ...job... } }
+on:
+  repository_dispatch:
+    types: [process-video]
+
+# Allow many videos to process at once (different users / channels).
+concurrency:
+  group: process-${{ github.event.client_payload.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+
+      - name: Install yt-dlp
+        run: |
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          yt-dlp --version
+
+      - name: Install worker deps
+        run: npm ci --omit=dev || npm install --omit=dev
+
+      - name: Process video
+        env:
+          JOB_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          WORK_DIR: ${{ runner.temp }}
+          FONT_FILE: /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: node process.mjs
