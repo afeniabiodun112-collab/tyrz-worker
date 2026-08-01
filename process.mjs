@@ -1,69 +1,81 @@
 #!/usr/bin/env node
-// ─────────────────────────────────────────────────────────────────────────────
-// TYRZ FFmpeg worker — runs on a GitHub Actions runner (free, FFmpeg preinstalled).
-//
-// Triggered via repository_dispatch with a client payload:
-//   { jobId, videoUrl, youtubeVideoId, preset, skipEditing, callbackUrl, callbackSecret,
-//     pipUrl?, output: { r2Key } }
-//
-// Steps:
-//   1. Download the source video with yt-dlp (or fetch directly for Telegram uploads).
-//   2. ffprobe for width/height/duration.
-//   3. Compile the preset → FFmpeg args and run (unless skipEditing).
-//   4. Upload the result to R2 (S3-compatible).
-//   5. POST the callback so the server can publish to Instagram.
-//
-// Local test (no GitHub, no R2 upload):
-//   node process.mjs --local ./sample.mp4 --preset ./sample-preset.json --out ./out.mp4
-// ─────────────────────────────────────────────────────────────────────────────
+// TYRZ FFmpeg worker — GitHub Actions runner.
+// Storage: GitHub Release assets on this public repo (no Cloudflare R2).
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, stat } from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
 import path from 'node:path';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { normalizePreset, buildFfmpegCommand } from './compile.mjs';
 
 const exec = promisify(execFile);
 const WORK = process.env.WORK_DIR || '.';
 
-function log(...a) { console.log('[worker]', ...a); }
-
-async function run(cmd, args, opts = {}) {
-  log('$', cmd, args.slice(0, 12).join(' '), args.length > 12 ? '…' : '');
-  return exec(cmd, args, { maxBuffer: 1024 * 1024 * 64, ...opts });
+function log(...a) {
+  console.log('[worker]', ...a);
 }
 
-// ── yt-dlp download ──────────────────────────────────────────────────────────
+async function run(cmd, args, opts = {}) {
+  log('$', cmd, args.slice(0, 14).join(' '), args.length > 14 ? '…' : '');
+  try {
+    return await exec(cmd, args, { maxBuffer: 1024 * 1024 * 64, ...opts });
+  } catch (e) {
+    const msg = [e?.stderr, e?.stdout, e?.message].filter(Boolean).join('\n').slice(0, 1200);
+    throw new Error(`Command failed: ${cmd} ${args.join(' ')}\n${msg}`);
+  }
+}
+
 async function downloadVideo(videoUrl, dest) {
-  // Prefer a single progressive mp4 up to 1080p; fall back to best.
-  await run('yt-dlp', [
-    '-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b',
-    '--merge-output-format', 'mp4',
+  // YouTube needs a JS runtime (Deno) for player challenges.
+  const common = [
+    '--js-runtimes', 'deno',
     '--no-playlist',
+    '--no-warnings',
     '-o', dest,
-    videoUrl,
-  ]);
-  return dest;
+  ];
+  const attempts = [
+    [
+      '-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b',
+      '--merge-output-format', 'mp4',
+      ...common,
+      videoUrl,
+    ],
+    [
+      '-f', 'bv*[height<=1080]+ba/b[height<=1080]/b',
+      '--merge-output-format', 'mp4',
+      ...common,
+      videoUrl,
+    ],
+    ['-f', 'b', '--merge-output-format', 'mp4', ...common, videoUrl],
+  ];
+  let lastErr;
+  for (const args of attempts) {
+    try {
+      await run('yt-dlp', args);
+      return dest;
+    } catch (e) {
+      lastErr = e;
+      log('yt-dlp attempt failed, trying fallback…', String(e?.message || e).slice(0, 180));
+    }
+  }
+  throw lastErr || new Error('yt-dlp failed');
 }
 
 async function fetchToFile(url, dest) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`fetch ${url} -> ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
   const { writeFile } = await import('node:fs/promises');
-  await writeFile(dest, buf);
+  await writeFile(dest, Buffer.from(await res.arrayBuffer()));
   return dest;
 }
 
-// ── ffprobe ──────────────────────────────────────────────────────────────────
 async function probe(file) {
   const { stdout } = await run('ffprobe', [
     '-v', 'error',
     '-select_streams', 'v:0',
     '-show_entries', 'stream=width,height:format=duration',
-    '-of', 'json', file,
+    '-of', 'json',
+    file,
   ]);
   const j = JSON.parse(stdout);
   const s = j.streams?.[0] || {};
@@ -74,57 +86,109 @@ async function probe(file) {
   };
 }
 
-// ── R2 upload ────────────────────────────────────────────────────────────────
-function r2Client() {
-  return new S3Client({
-    region: 'auto',
-    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-    credentials: {
-      accessKeyId: process.env.R2_ACCESS_KEY_ID,
-      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-    },
+function ghHeaders(extra = {}) {
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) throw new Error('GITHUB_TOKEN not set — cannot create release');
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': 'tyrz-worker',
+    ...extra,
+  };
+}
+
+async function createRelease(tagName, name) {
+  const repo = process.env.GITHUB_REPOSITORY;
+  if (!repo) throw new Error('GITHUB_REPOSITORY not set');
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases`, {
+    method: 'POST',
+    headers: ghHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      tag_name: tagName,
+      name,
+      body: 'Auto-generated by the TYRZ worker. Safe to delete once the platform has ingested the video.',
+      draft: false,
+      prerelease: false,
+    }),
   });
+  if (!res.ok) {
+    throw new Error(`create release failed: ${res.status} ${await res.text()}`);
+  }
+  return res.json();
 }
 
-async function uploadR2(file, key) {
-  const client = r2Client();
-  const body = createReadStream(file);
+async function uploadReleaseAsset(uploadUrlTemplate, assetName, file) {
+  const uploadUrl =
+    uploadUrlTemplate.replace(/\{.*\}$/, '') +
+    `?name=${encodeURIComponent(assetName)}`;
+  const buffer = await readFile(file);
+  const res = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: ghHeaders({
+      'Content-Type': 'video/mp4',
+      'Content-Length': String(buffer.length),
+    }),
+    body: buffer,
+  });
+  if (!res.ok) {
+    throw new Error(`upload asset failed: ${res.status} ${await res.text()}`);
+  }
+  return res.json();
+}
+
+async function uploadToGithubRelease(file, jobId, assetName) {
   const { size } = await stat(file);
-  await client.send(new PutObjectCommand({
-    Bucket: process.env.R2_BUCKET,
-    Key: key,
-    Body: body,
-    ContentType: 'video/mp4',
-    ContentLength: size,
-  }));
-  log('uploaded to R2:', key, `(${(size / 1e6).toFixed(1)} MB)`);
-  return key;
+  const tagName = `job-${jobId}-${Date.now()}`;
+  const release = await createRelease(tagName, `TYRZ video ${jobId}`);
+  const asset = await uploadReleaseAsset(release.upload_url, assetName, file);
+  log('uploaded to GitHub Release:', tagName, `(${(size / 1e6).toFixed(1)} MB)`);
+  return {
+    url: asset.browser_download_url,
+    releaseId: release.id,
+    assetId: asset.id,
+  };
 }
 
-// ── callback ─────────────────────────────────────────────────────────────────
 async function callback(url, payload, secret) {
+  if (!url) return;
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-tyrz-callback': secret },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-tyrz-callback': secret || '',
+    },
     body: JSON.stringify(payload),
   });
   log('callback', url, '->', res.status);
 }
 
-// ── main ─────────────────────────────────────────────────────────────────────
+async function notify(url, secret, jobId, status) {
+  if (!url) return;
+  await callback(url, { jobId, status }, secret).catch(() => {});
+}
+
+function argFlag(argv, name) {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
 
-  // Local test mode.
   if (argv[0] === '--local') {
     const input = argv[1];
     const presetPath = argFlag(argv, '--preset');
     const out = argFlag(argv, '--out') || path.join(WORK, 'out.mp4');
-    const cfg = normalizePreset(presetPath ? JSON.parse(await readFile(presetPath, 'utf8')) : {});
+    const cfg = normalizePreset(
+      presetPath ? JSON.parse(await readFile(presetPath, 'utf8')) : {}
+    );
     const meta = await probe(input);
     log('probe:', meta);
     const { args, filter } = buildFfmpegCommand(cfg, {
-      input, output: out, ...meta,
+      input,
+      output: out,
+      ...meta,
       pipInput: cfg.pip.enabled ? argFlag(argv, '--pip') : undefined,
       fontFile: process.env.FONT_FILE,
     });
@@ -134,15 +198,21 @@ async function main() {
     return;
   }
 
-  // Production: payload provided via env (from the Actions workflow).
   const payload = JSON.parse(process.env.JOB_PAYLOAD || '{}');
   const {
-    jobId, videoUrl, preset, skipEditing, source,
-    callbackUrl, callbackSecret, pipUrl, output,
+    jobId,
+    videoUrl,
+    preset,
+    skipEditing,
+    source,
+    callbackUrl,
+    callbackSecret,
+    pipUrl,
+    output,
   } = payload;
 
   if (!jobId) throw new Error('No jobId in JOB_PAYLOAD');
-  const key = output?.r2Key || `videos/${jobId}.mp4`;
+  const assetName = output?.assetName || `${jobId}.mp4`;
   const src = path.join(WORK, `src-${jobId}.mp4`);
   const outFile = path.join(WORK, `out-${jobId}.mp4`);
 
@@ -163,13 +233,16 @@ async function main() {
       if (!meta.width) throw new Error('ffprobe found no video stream');
 
       let pipInput;
-      if (cfg.pip.enabled && pipUrl) {
+      if (cfg.pip?.enabled && pipUrl) {
         pipInput = path.join(WORK, `pip-${jobId}${path.extname(pipUrl) || '.png'}`);
         await fetchToFile(pipUrl, pipInput);
       }
 
       const { args } = buildFfmpegCommand(cfg, {
-        input: src, output: outFile, ...meta, pipInput,
+        input: src,
+        output: outFile,
+        ...meta,
+        pipInput,
         fontFile: process.env.FONT_FILE,
       });
       await run('ffmpeg', args);
@@ -177,29 +250,31 @@ async function main() {
     }
 
     await notify(callbackUrl, callbackSecret, jobId, 'uploading');
-    await uploadR2(finalFile, key);
+    const { url, releaseId, assetId } = await uploadToGithubRelease(
+      finalFile,
+      jobId,
+      assetName
+    );
 
-    await callback(callbackUrl, {
-      jobId, status: 'edited', r2Key: key,
-    }, callbackSecret);
+    await callback(
+      callbackUrl,
+      { jobId, status: 'edited', videoUrl: url, releaseId, assetId },
+      callbackSecret
+    );
     log('✅ job complete:', jobId);
   } catch (err) {
     log('❌ job failed:', err?.message);
-    await callback(callbackUrl, {
-      jobId, status: 'failed', error: String(err?.message || err).slice(0, 500),
-    }, callbackSecret).catch(() => {});
+    await callback(
+      callbackUrl,
+      {
+        jobId,
+        status: 'failed',
+        error: String(err?.message || err).slice(0, 500),
+      },
+      callbackSecret
+    ).catch(() => {});
     process.exitCode = 1;
   }
-}
-
-async function notify(url, secret, jobId, status) {
-  if (!url) return;
-  await callback(url, { jobId, status }, secret).catch(() => {});
-}
-
-function argFlag(argv, name) {
-  const i = argv.indexOf(name);
-  return i >= 0 ? argv[i + 1] : undefined;
 }
 
 main().catch((err) => {
