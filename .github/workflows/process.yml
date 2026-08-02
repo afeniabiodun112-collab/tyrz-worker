@@ -1,0 +1,63 @@
+name: TYRZ Process Video
+
+on:
+  repository_dispatch:
+    types: [process-video]
+
+concurrency:
+  group: process-${{ github.event.client_payload.jobId }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Setup FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+
+      - name: Install yt-dlp (nightly preferred)
+        run: |
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo curl -fsSL -o /tmp/yt-dlp-n \
+            "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp" \
+            && sudo mv /tmp/yt-dlp-n /usr/local/bin/yt-dlp || true
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          yt-dlp --version
+          deno --version
+
+      - name: Optional impersonate deps
+        run: |
+          pip3 install --user curl-cffi 2>/dev/null || true
+          echo "PATH=$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Install worker deps
+        run: npm ci --omit=dev || npm install --omit=dev
+
+      - name: Process video
+        env:
+          JOB_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          WORK_DIR: ${{ runner.temp }}
+          FONT_FILE: /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          YTDLP_COOKIES: ${{ secrets.YTDLP_COOKIES }}
+          YTDLP_PROXY: ${{ secrets.YTDLP_PROXY }}
+          YTDLP_MAX_ATTEMPTS: ${{ secrets.YTDLP_MAX_ATTEMPTS }}
+          YTDLP_RETRY_BASE_MS: ${{ secrets.YTDLP_RETRY_BASE_MS }}
+        run: node process.mjs
