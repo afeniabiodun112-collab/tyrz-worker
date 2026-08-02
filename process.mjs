@@ -1,31 +1,28 @@
 #!/usr/bin/env node
 // ─────────────────────────────────────────────────────────────────────────────
-// TYRZ FFmpeg worker — GitHub Actions runner (hardened download, 2026).
+// TYRZ FFmpeg worker — GitHub Actions runner (hardened + cookies, 2026).
 // Storage: GitHub Release assets on this public repo (no Cloudflare R2).
 //
-// Download strategy (no cookies / no login):
-//   1. Multi-client yt-dlp rotation (android / ios / android_vr / tv_simply / …)
-//   2. Optional PO-Token provider (bgutil) if POT_PROVIDER_URL is set
-//   3. Optional --impersonate chrome on retry attempts
-//   4. Optional HTTP(S) proxy via YTDLP_PROXY or HTTPS_PROXY
+// Download strategy:
+//   1. If YTDLP_COOKIES secret is set → write cookies.txt and use --cookies
+//   2. Multi-client yt-dlp rotation (android / ios / android_vr / …)
+//   3. Optional --impersonate chrome on later attempts
+//   4. Optional HTTP(S) proxy via YTDLP_PROXY
 //   5. Bounded retries with backoff + clear failure logging
 //
-// On permanent failure the job callbacks status=failed with a short error so
-// the server can surface it / retry later. No Telegram path in this build.
+// On permanent failure → callback status=failed with short error.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile, stat, unlink } from 'node:fs/promises';
+import { readFile, writeFile, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { normalizePreset, buildFfmpegCommand } from './compile.mjs';
 
 const exec = promisify(execFile);
 const WORK = process.env.WORK_DIR || '.';
 
-/** Max full download attempts (each attempt may try several clients). */
 const MAX_DOWNLOAD_ATTEMPTS = Number(process.env.YTDLP_MAX_ATTEMPTS || 3);
-/** Base delay (ms) between full attempts. */
 const RETRY_BASE_MS = Number(process.env.YTDLP_RETRY_BASE_MS || 4000);
 
 function log(...a) {
@@ -33,12 +30,16 @@ function log(...a) {
 }
 
 async function run(cmd, args, opts = {}) {
-  log('$', cmd, args.slice(0, 14).join(' '), args.length > 14 ? '…' : '');
+  // Never log full cookie path contents; only show that --cookies is present.
+  const safeArgs = args.map((a, i) =>
+    args[i - 1] === '--cookies' ? '<cookies.txt>' : a
+  );
+  log('$', cmd, safeArgs.slice(0, 16).join(' '), safeArgs.length > 16 ? '…' : '');
   try {
     return await exec(cmd, args, { maxBuffer: 1024 * 1024 * 64, ...opts });
   } catch (e) {
     const msg = [e?.stderr, e?.stdout, e?.message].filter(Boolean).join('\n').slice(0, 1200);
-    throw new Error(`Command failed: ${cmd} ${args.join(' ')}\n${msg}`);
+    throw new Error(`Command failed: ${cmd} ${safeArgs.join(' ')}\n${msg}`);
   }
 }
 
@@ -50,20 +51,41 @@ function isBotBlock(msg) {
   return /not a bot|Sign in to confirm|confirm you.?re not a bot|HTTP Error 403/i.test(msg);
 }
 
+function isAuthError(msg) {
+  return /cookies?|login|authentication|Sign in to confirm|not a bot/i.test(msg);
+}
+
 /**
- * Ordered player_client strategies (2026).
- * Prefer clients that still work more often without cookies / PO tokens.
+ * Write YTDLP_COOKIES secret to a temp Netscape cookies file.
+ * Returns path or null if secret is missing/empty.
  */
+async function materializeCookies() {
+  const raw = (process.env.YTDLP_COOKIES || '').trim();
+  if (!raw) return null;
+
+  // Accept either full Netscape file or raw cookie lines.
+  let body = raw;
+  if (!body.includes('Netscape') && !body.startsWith('#')) {
+    body = '# Netscape HTTP Cookie File\n' + body;
+  }
+
+  const dest = path.join(WORK, 'yt-cookies.txt');
+  await writeFile(dest, body + (body.endsWith('\n') ? '' : '\n'), 'utf8');
+  log('cookies file written', dest, `(${body.length} chars)`);
+  return dest;
+}
+
 function clientStrategies() {
+  // With cookies, web + mweb often work best; still try mobile/TV as fallback.
   return [
+    'web,mweb',
     'android,ios',
-    'android_vr',
-    'ios',
     'android',
+    'ios',
+    'android_vr',
     'tv_simply',
     'web_embedded',
     'mweb',
-    'tv_embedded',
     'web',
   ];
 }
@@ -76,10 +98,7 @@ function formatStrategies() {
   ];
 }
 
-/**
- * One yt-dlp invocation with a specific client + format.
- */
-async function ytdlpOnce(videoUrl, dest, { client, format, useImpersonate, potProvider }) {
+async function ytdlpOnce(videoUrl, dest, { client, format, useImpersonate, cookiesPath }) {
   const args = [
     '-f', format,
     '--merge-output-format', 'mp4',
@@ -92,10 +111,8 @@ async function ytdlpOnce(videoUrl, dest, { client, format, useImpersonate, potPr
     '-o', dest,
   ];
 
-  // Optional PO-Token provider (bgutil). Plugin auto-hooks when installed;
-  // POT_PROVIDER_URL documents the endpoint for operators.
-  if (potProvider) {
-    process.env.BGUTIL_PROVIDER_URL = potProvider;
+  if (cookiesPath) {
+    args.push('--cookies', cookiesPath);
   }
 
   if (useImpersonate) {
@@ -112,26 +129,25 @@ async function ytdlpOnce(videoUrl, dest, { client, format, useImpersonate, potPr
 }
 
 /**
- * Hardened download with client rotation + bounded outer retries.
- *
- * Failure / retry policy:
- * - Bot-check on a client → skip remaining formats for that client, try next client.
- * - After all clients fail → wait (backoff) and retry the whole rotation
- *   (up to MAX_DOWNLOAD_ATTEMPTS, default 3).
- * - Permanent failure → throw with a concise message for the job callback
- *   (status=failed). Server can re-dispatch later.
+ * Hardened download with cookies (preferred) + client rotation + retries.
  */
 async function downloadVideo(videoUrl, dest) {
+  const cookiesPath = await materializeCookies();
+  if (cookiesPath) {
+    log('using YTDLP_COOKIES secret');
+  } else {
+    log('WARNING: no YTDLP_COOKIES secret — relying on client rotation only (often blocked on Actions IPs)');
+  }
+
   const clients = clientStrategies();
   const formats = formatStrategies();
-  const potProvider = (process.env.POT_PROVIDER_URL || '').trim() || null;
   let lastErr;
   const attemptLog = [];
 
   for (let attempt = 1; attempt <= MAX_DOWNLOAD_ATTEMPTS; attempt++) {
     const useImpersonate = attempt >= 2;
     log(`download attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}`, {
-      pot: !!potProvider,
+      cookies: !!cookiesPath,
       impersonate: useImpersonate,
       proxy: !!(process.env.YTDLP_PROXY || process.env.HTTPS_PROXY),
     });
@@ -140,13 +156,13 @@ async function downloadVideo(videoUrl, dest) {
       let botBlocked = false;
       for (const fmt of formats) {
         try {
-          try { await unlink(dest); } catch { /* ignore missing */ }
+          try { await unlink(dest); } catch { /* ignore */ }
 
           await ytdlpOnce(videoUrl, dest, {
             client,
             format: fmt,
             useImpersonate,
-            potProvider,
+            cookiesPath,
           });
 
           const st = await stat(dest);
@@ -154,7 +170,7 @@ async function downloadVideo(videoUrl, dest) {
             throw new Error(`downloaded file too small (${st.size} bytes)`);
           }
 
-          log('download ok', { client, attempt, bytes: st.size });
+          log('download ok', { client, attempt, bytes: st.size, cookies: !!cookiesPath });
           return dest;
         } catch (e) {
           lastErr = e;
@@ -163,7 +179,7 @@ async function downloadVideo(videoUrl, dest) {
           attemptLog.push(`a${attempt}/${client}: ${short}`);
           log('yt-dlp failed', { attempt, client, fmt: fmt.slice(0, 36) }, short);
 
-          if (isBotBlock(msg)) {
+          if (isBotBlock(msg) || isAuthError(msg)) {
             botBlocked = true;
             break;
           }
@@ -180,16 +196,17 @@ async function downloadVideo(videoUrl, dest) {
   }
 
   const summary = attemptLog.slice(-8).join(' | ') || String(lastErr?.message || lastErr);
+  const hint = cookiesPath
+    ? 'Cookies may be expired — re-export from browser and update YTDLP_COOKIES secret.'
+    : 'No cookies secret set. Add YTDLP_COOKIES or a residential YTDLP_PROXY.';
   throw new Error(
-    `yt-dlp exhausted ${MAX_DOWNLOAD_ATTEMPTS} attempts (no cookies). ` +
-      `Last errors: ${summary.slice(0, 500)}`
+    `yt-dlp exhausted ${MAX_DOWNLOAD_ATTEMPTS} attempts. ${hint} Last errors: ${summary.slice(0, 400)}`
   );
 }
 
 async function fetchToFile(url, dest) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`fetch ${url} -> ${res.status}`);
-  const { writeFile } = await import('node:fs/promises');
   await writeFile(dest, Buffer.from(await res.arrayBuffer()));
   return dest;
 }
