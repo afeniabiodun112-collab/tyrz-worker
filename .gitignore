@@ -1,7 +1,0 @@
-node_modules/
-*.mp4
-*.jpg
-*.png
-!sample*
-_work/
-out*.mp4
