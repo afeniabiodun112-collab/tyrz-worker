@@ -1,15 +1,32 @@
 #!/usr/bin/env node
-// TYRZ FFmpeg worker — GitHub Actions runner.
+// ─────────────────────────────────────────────────────────────────────────────
+// TYRZ FFmpeg worker — GitHub Actions runner (hardened download, 2026).
 // Storage: GitHub Release assets on this public repo (no Cloudflare R2).
+//
+// Download strategy (no cookies / no login):
+//   1. Multi-client yt-dlp rotation (android / ios / android_vr / tv_simply / …)
+//   2. Optional PO-Token provider (bgutil) if POT_PROVIDER_URL is set
+//   3. Optional --impersonate chrome on retry attempts
+//   4. Optional HTTP(S) proxy via YTDLP_PROXY or HTTPS_PROXY
+//   5. Bounded retries with backoff + clear failure logging
+//
+// On permanent failure the job callbacks status=failed with a short error so
+// the server can surface it / retry later. No Telegram path in this build.
+// ─────────────────────────────────────────────────────────────────────────────
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { normalizePreset, buildFfmpegCommand } from './compile.mjs';
 
 const exec = promisify(execFile);
 const WORK = process.env.WORK_DIR || '.';
+
+/** Max full download attempts (each attempt may try several clients). */
+const MAX_DOWNLOAD_ATTEMPTS = Number(process.env.YTDLP_MAX_ATTEMPTS || 3);
+/** Base delay (ms) between full attempts. */
+const RETRY_BASE_MS = Number(process.env.YTDLP_RETRY_BASE_MS || 4000);
 
 function log(...a) {
   console.log('[worker]', ...a);
@@ -25,40 +42,148 @@ async function run(cmd, args, opts = {}) {
   }
 }
 
-async function downloadVideo(videoUrl, dest) {
-  // YouTube needs a JS runtime (Deno) for player challenges.
-  const common = [
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isBotBlock(msg) {
+  return /not a bot|Sign in to confirm|confirm you.?re not a bot|HTTP Error 403/i.test(msg);
+}
+
+/**
+ * Ordered player_client strategies (2026).
+ * Prefer clients that still work more often without cookies / PO tokens.
+ */
+function clientStrategies() {
+  return [
+    'android,ios',
+    'android_vr',
+    'ios',
+    'android',
+    'tv_simply',
+    'web_embedded',
+    'mweb',
+    'tv_embedded',
+    'web',
+  ];
+}
+
+function formatStrategies() {
+  return [
+    'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b',
+    'bv*[height<=1080]+ba/b[height<=1080]/b',
+    'b',
+  ];
+}
+
+/**
+ * One yt-dlp invocation with a specific client + format.
+ */
+async function ytdlpOnce(videoUrl, dest, { client, format, useImpersonate, potProvider }) {
+  const args = [
+    '-f', format,
+    '--merge-output-format', 'mp4',
     '--js-runtimes', 'deno',
+    '--extractor-args', `youtube:player_client=${client}`,
     '--no-playlist',
     '--no-warnings',
+    '--retries', '2',
+    '--fragment-retries', '2',
     '-o', dest,
   ];
-  const attempts = [
-    [
-      '-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b',
-      '--merge-output-format', 'mp4',
-      ...common,
-      videoUrl,
-    ],
-    [
-      '-f', 'bv*[height<=1080]+ba/b[height<=1080]/b',
-      '--merge-output-format', 'mp4',
-      ...common,
-      videoUrl,
-    ],
-    ['-f', 'b', '--merge-output-format', 'mp4', ...common, videoUrl],
-  ];
+
+  // Optional PO-Token provider (bgutil). Plugin auto-hooks when installed;
+  // POT_PROVIDER_URL documents the endpoint for operators.
+  if (potProvider) {
+    process.env.BGUTIL_PROVIDER_URL = potProvider;
+  }
+
+  if (useImpersonate) {
+    args.push('--impersonate', 'chrome');
+  }
+
+  const proxy = process.env.YTDLP_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  if (proxy) {
+    args.push('--proxy', proxy);
+  }
+
+  args.push(videoUrl);
+  await run('yt-dlp', args);
+}
+
+/**
+ * Hardened download with client rotation + bounded outer retries.
+ *
+ * Failure / retry policy:
+ * - Bot-check on a client → skip remaining formats for that client, try next client.
+ * - After all clients fail → wait (backoff) and retry the whole rotation
+ *   (up to MAX_DOWNLOAD_ATTEMPTS, default 3).
+ * - Permanent failure → throw with a concise message for the job callback
+ *   (status=failed). Server can re-dispatch later.
+ */
+async function downloadVideo(videoUrl, dest) {
+  const clients = clientStrategies();
+  const formats = formatStrategies();
+  const potProvider = (process.env.POT_PROVIDER_URL || '').trim() || null;
   let lastErr;
-  for (const args of attempts) {
-    try {
-      await run('yt-dlp', args);
-      return dest;
-    } catch (e) {
-      lastErr = e;
-      log('yt-dlp attempt failed, trying fallback…', String(e?.message || e).slice(0, 180));
+  const attemptLog = [];
+
+  for (let attempt = 1; attempt <= MAX_DOWNLOAD_ATTEMPTS; attempt++) {
+    const useImpersonate = attempt >= 2;
+    log(`download attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}`, {
+      pot: !!potProvider,
+      impersonate: useImpersonate,
+      proxy: !!(process.env.YTDLP_PROXY || process.env.HTTPS_PROXY),
+    });
+
+    for (const client of clients) {
+      let botBlocked = false;
+      for (const fmt of formats) {
+        try {
+          try { await unlink(dest); } catch { /* ignore missing */ }
+
+          await ytdlpOnce(videoUrl, dest, {
+            client,
+            format: fmt,
+            useImpersonate,
+            potProvider,
+          });
+
+          const st = await stat(dest);
+          if (st.size < 10_000) {
+            throw new Error(`downloaded file too small (${st.size} bytes)`);
+          }
+
+          log('download ok', { client, attempt, bytes: st.size });
+          return dest;
+        } catch (e) {
+          lastErr = e;
+          const msg = String(e?.message || e);
+          const short = msg.replace(/\s+/g, ' ').slice(0, 180);
+          attemptLog.push(`a${attempt}/${client}: ${short}`);
+          log('yt-dlp failed', { attempt, client, fmt: fmt.slice(0, 36) }, short);
+
+          if (isBotBlock(msg)) {
+            botBlocked = true;
+            break;
+          }
+        }
+      }
+      if (botBlocked) continue;
+    }
+
+    if (attempt < MAX_DOWNLOAD_ATTEMPTS) {
+      const delay = RETRY_BASE_MS * attempt + Math.floor(Math.random() * 1500);
+      log(`all clients failed on attempt ${attempt}; sleeping ${delay}ms before retry`);
+      await sleep(delay);
     }
   }
-  throw lastErr || new Error('yt-dlp failed');
+
+  const summary = attemptLog.slice(-8).join(' | ') || String(lastErr?.message || lastErr);
+  throw new Error(
+    `yt-dlp exhausted ${MAX_DOWNLOAD_ATTEMPTS} attempts (no cookies). ` +
+      `Last errors: ${summary.slice(0, 500)}`
+  );
 }
 
 async function fetchToFile(url, dest) {
